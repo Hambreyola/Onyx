@@ -1,6 +1,11 @@
-#include <time.h>     // For clock_gettime
-#include <stdlib.h>   // For setenv
-#include <stdbool.h>
+#include "wlr-layer-shell-unstable-v1-protocol.h"
+#include <wlr/types/wlr_xdg_output_v1.h>
+#include <wlr/types/wlr_idle_inhibit_v1.h>
+#include <wlr/types/wlr_data_control_v1.h>
+#include <wlr/types/wlr_layer_shell_v1.h>
+#include <time.h>     // For clock_gettime 
+#include <stdlib.h>   // For setenv 
+#include <stdbool.h>  
 #include <assert.h>
 #include <getopt.h>
 #include <stdbool.h>
@@ -29,12 +34,38 @@
 #include <xkbcommon/xkbcommon.h>
 #include <linux/input-event-codes.h> // For BTN_LEFT and BTN_RIGHT
 
+struct tinywl_toplevel {
+    struct wl_list link;
+    struct tinywl_server *server;
+    struct wlr_xdg_toplevel *xdg_toplevel;
+    struct wlr_scene_tree *scene_tree;
+    int x, y;
+    struct wl_listener map;
+    struct wl_listener unmap;
+    struct wl_listener commit;   // <--- Required for the error at line 750
+    struct wl_listener destroy;
+    struct wl_listener request_move;
+    struct wl_listener request_resize;
+    struct wl_listener request_maximize;
+    struct wl_listener request_fullscreen;
+};
+
+struct tinywl_layer_surface {
+    struct wl_list link;
+    struct tinywl_server *server;
+    struct wlr_layer_surface_v1 *layer_surface;
+    struct wlr_scene_layer_surface_v1 *scene_layer;
+    struct wl_listener map;
+    struct wl_listener unmap;
+    struct wl_listener destroy;
+    struct wl_listener surface_commit;
+};
+
+
 // Forward declarations to stop the "implicit declaration" errors
-struct tinywl_toplevel;
 enum tinywl_cursor_mode;
 static void begin_interactive(struct tinywl_toplevel *toplevel, 
                              enum tinywl_cursor_mode mode, uint32_t edges);
-
 
 /* For brevity's sake, struct members are annotated where they are used. */
 enum tinywl_cursor_mode {
@@ -79,6 +110,11 @@ struct tinywl_server {
 	struct wlr_output_layout *output_layout;
 	struct wl_list outputs;
 	struct wl_listener new_output;
+
+	// Layer shell support
+	struct wlr_layer_shell_v1 *layer_shell;
+    struct wl_listener new_layer_surface;
+    struct wl_list layer_surfaces; // To keep track of bars/wallpapers
 };
 
 struct tinywl_output {
@@ -90,20 +126,22 @@ struct tinywl_output {
 	struct wl_listener destroy;
 };
 
-struct tinywl_toplevel {
-	struct wl_list link;
-	struct tinywl_server *server;
-	struct wlr_xdg_toplevel *xdg_toplevel;
-	struct wlr_scene_tree *scene_tree;
-	struct wl_listener map;
-	struct wl_listener unmap;
-	struct wl_listener commit;
-	struct wl_listener destroy;
-	struct wl_listener request_move;
-	struct wl_listener request_resize;
-	struct wl_listener request_maximize;
-	struct wl_listener request_fullscreen;
-};
+//struct tinywl_toplevel {
+//    struct wl_list link;
+//    struct tinywl_server *server;
+//    struct wlr_xdg_toplevel *xdg_toplevel;
+//    struct wlr_scene_tree *scene_tree;
+//    
+//    int x, y; // Keep these!
+//
+//    struct wl_listener map;
+//    struct wl_listener unmap;
+//    struct wl_listener destroy;
+//    struct wl_listener request_move;
+//    struct wl_listener request_resize;
+//    struct wl_listener request_maximize;
+//    struct wl_listener request_fullscreen;
+//};
 
 struct tinywl_popup {
 	struct wlr_xdg_popup *xdg_popup;
@@ -146,6 +184,7 @@ static void focus_toplevel(struct tinywl_toplevel *toplevel) {
 			wlr_xdg_toplevel_set_activated(prev_toplevel, false);
 		}
 	}
+
 	struct wlr_keyboard *keyboard = wlr_seat_get_keyboard(seat);
 	/* Move the toplevel to the front */
 	wlr_scene_node_raise_to_top(&toplevel->scene_tree->node);
@@ -219,7 +258,7 @@ static void keyboard_handle_key(struct wl_listener *listener, void *data) {
 	uint32_t modifiers = wlr_keyboard_get_modifiers(keyboard->wlr_keyboard);
 	bool handled = false;
 
-	if (event->state == WL_KEYBOARD_KEY_STATE_PRESSED && (modifiers & WLR_MODIFIER_LOGO)) {
+	if (event->state == WL_KEYBOARD_KEY_STATE_PRESSED && (modifiers & WLR_MODIFIER_ALT)) {
 		for (int i = 0; i < nsyms; i++) {
 			handled = handle_keybinding(server, syms[i]);
 		}
@@ -527,30 +566,37 @@ static void server_cursor_button(struct wl_listener *listener, void *data) {
 	struct tinywl_server *server = wl_container_of(listener, server, cursor_button);
 	struct wlr_pointer_button_event *event = data;
 	
+	/* Notify the seat of the button event so clients know they were clicked */
 	wlr_seat_pointer_notify_button(server->seat, 
             event->time_msec, event->button, event->state);
 
-	// Get current modifiers from the seat's keyboard
-	struct wlr_keyboard *keyboard = wlr_seat_get_keyboard(server->seat);
-	uint32_t mods = keyboard ? wlr_keyboard_get_modifiers(keyboard) : 0;
+	double sx, sy;
+	struct wlr_surface *surface = NULL;
+	
+	/* Find what's under the cursor */
+	struct tinywl_toplevel *toplevel = desktop_toplevel_at(
+			server, server->cursor->x, server->cursor->y, &surface, &sx, &sy);
 
-	// FIX: Use WL_POINTER_BUTTON_STATE_RELEASED instead of keyboard state
 	if (event->state == WL_POINTER_BUTTON_STATE_RELEASED) {
+		/* If you were moving/resizing a window, stop now */
 		server->cursor_mode = TINYWL_CURSOR_PASSTHROUGH;
-	} else {
-		// ONLY move/resize if Super (Logo) is held
-		if (mods & WLR_MODIFIER_LOGO) {
-			double sx, sy;
-			struct wlr_surface *surface = NULL;
-			struct tinywl_toplevel *toplevel = desktop_toplevel_at(
-					server, server->cursor->x, server->cursor->y, &surface, &sx, &sy);
+	} else if (surface != NULL) {
+		/* * We clicked something! 
+		 * If it's a regular window (toplevel), handle focus and movement.
+		 * If toplevel is NULL, it's a Layer Surface (the Bar), so we just focus the surface 
+		 * but DON'T try to use the 'toplevel' pointer.
+		 */
+		focus_toplevel(toplevel); // This function already handles NULL safely
 
-			if (toplevel != NULL) {
-				if (event->button == BTN_LEFT) {
-					begin_interactive(toplevel, TINYWL_CURSOR_MOVE, 0);
-				} else if (event->button == BTN_RIGHT) {
-					begin_interactive(toplevel, TINYWL_CURSOR_RESIZE, 0);
-				}
+		/* Support Alt+Click to move/resize regular windows */
+		struct wlr_keyboard *keyboard = wlr_seat_get_keyboard(server->seat);
+		uint32_t mods = keyboard ? wlr_keyboard_get_modifiers(keyboard) : 0;
+
+		if ((mods & WLR_MODIFIER_ALT) && toplevel != NULL) {
+			if (event->button == BTN_LEFT) {
+				begin_interactive(toplevel, TINYWL_CURSOR_MOVE, 0);
+			} else if (event->button == BTN_RIGHT) {
+				begin_interactive(toplevel, TINYWL_CURSOR_RESIZE, 0);
 			}
 		}
 	}
@@ -893,6 +939,99 @@ static void server_new_xdg_popup(struct wl_listener *listener, void *data) {
 	wl_signal_add(&xdg_popup->events.destroy, &popup->destroy);
 }
 
+//
+// Shell layer handling 
+//
+
+static void arrange_layers(struct tinywl_server *server) {
+    if (wl_list_empty(&server->outputs)) return;
+
+    struct tinywl_output *output = wl_container_of(server->outputs.next, output, link);
+    int width, height;
+    wlr_output_effective_resolution(output->wlr_output, &width, &height);
+
+    struct wlr_box usable_area = { .x = 0, .y = 0, .width = width, .height = height };
+
+    struct tinywl_layer_surface *layer;
+    wl_list_for_each(layer, &server->layer_surfaces, link) {
+        struct wlr_layer_surface_v1_state *state = &layer->layer_surface->current;
+        
+        // ONLY shrink the usable area if the layer is actually mapped/visible
+        if (layer->layer_surface->surface->mapped && state->exclusive_zone > 0) {
+            if (state->anchor & ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP) {
+                usable_area.y += state->exclusive_zone;
+                usable_area.height -= state->exclusive_zone;
+            } else if (state->anchor & ZWLR_LAYER_SURFACE_V1_ANCHOR_BOTTOM) {
+                usable_area.height -= state->exclusive_zone;
+            }
+        }
+        
+        // IMPORTANT: Tell the layer its size, but don't force it if it's already right
+        wlr_layer_surface_v1_configure(layer->layer_surface, width, height);
+    }
+
+    // Move regular windows to the new usable area
+    struct tinywl_toplevel *toplevel;
+    wl_list_for_each(toplevel, &server->toplevels, link) {
+        if (!toplevel->xdg_toplevel->base->surface->mapped) continue;
+
+        // Update position only if it changed
+        if (toplevel->x != usable_area.x || toplevel->y != usable_area.y) {
+            toplevel->x = usable_area.x;
+            toplevel->y = usable_area.y;
+            wlr_scene_node_set_position(&toplevel->scene_tree->node, toplevel->x, toplevel->y);
+            wlr_xdg_toplevel_set_size(toplevel->xdg_toplevel, usable_area.width, usable_area.height);
+        }
+    }
+}
+
+static void layer_shell_handle_map(struct wl_listener *listener, void *data) {
+    (void)listener; (void)data;
+}
+
+static void layer_shell_handle_unmap(struct wl_listener *listener, void *data) {
+    (void)listener; (void)data;
+}
+
+static void layer_shell_handle_destroy(struct wl_listener *listener, void *data) {
+    struct tinywl_layer_surface *layer_surface = wl_container_of(listener, layer_surface, destroy);
+    wl_list_remove(&layer_surface->link);
+    free(layer_surface);
+}
+
+static void layer_shell_handle_surface_commit(struct wl_listener *listener, void *data) {
+    struct tinywl_layer_surface *layer_surface = wl_container_of(listener, layer_surface, surface_commit);
+    
+    // Only re-arrange if the 'exclusive zone' or 'size' actually changed in this commit
+    if (layer_surface->layer_surface->initial_commit) {
+        arrange_layers(layer_surface->server);
+    }
+}
+
+//after other layers
+static void server_new_layer_surface(struct wl_listener *listener, void *data) {
+    struct tinywl_server *server = wl_container_of(listener, server, new_layer_surface);
+    struct wlr_layer_surface_v1 *wlr_layer_surface = data;
+
+    struct tinywl_layer_surface *layer_surface = calloc(1, sizeof(struct tinywl_layer_surface));
+    layer_surface->server = server;
+    layer_surface->layer_surface = wlr_layer_surface;
+
+    // Determine the scene layer (Wallpaper vs Bar)
+    struct wlr_scene_tree *parent = &server->scene->tree; 
+    layer_surface->scene_layer = wlr_scene_layer_surface_v1_create(parent, wlr_layer_surface);
+
+    layer_surface->surface_commit.notify = layer_shell_handle_surface_commit;
+    wl_signal_add(&wlr_layer_surface->surface->events.commit, &layer_surface->surface_commit);
+
+    layer_surface->destroy.notify = layer_shell_handle_destroy;
+    wl_signal_add(&wlr_layer_surface->events.destroy, &layer_surface->destroy);
+
+    wl_list_insert(&server->layer_surfaces, &layer_surface->link);
+}
+
+
+
 int main(int argc, char *argv[]) {
 	wlr_log_init(WLR_DEBUG, NULL);
 	char *startup_cmd = NULL;
@@ -965,6 +1104,19 @@ int main(int argc, char *argv[]) {
 	 * arrangement of screens in a physical layout. */
 	server.output_layout = wlr_output_layout_create(server.wl_display);
 
+	server.xdg_shell = wlr_xdg_shell_create(server.wl_display, 3);
+
+    // 2. Layer Shell (The one we just built for bars/wallpapers)
+    server.layer_shell = wlr_layer_shell_v1_create(server.wl_display, 4);
+    server.new_layer_surface.notify = server_new_layer_surface;
+    wl_signal_add(&server.layer_shell->events.new_surface, &server.new_layer_surface);
+
+    // 3. The "Missing Resources" for Waybar
+    wlr_xdg_output_manager_v1_create(server.wl_display, server.output_layout);
+    wlr_idle_inhibit_v1_create(server.wl_display);
+    wlr_data_control_manager_v1_create(server.wl_display);
+
+
 	/* Configure a listener to be notified when new outputs are available on the
 	 * backend. */
 	wl_list_init(&server.outputs);
@@ -984,12 +1136,20 @@ int main(int argc, char *argv[]) {
 	 * used for application windows. For more detail on shells, refer to
 	 * https://drewdevault.com/2018/07/29/Wayland-shells.html.
 	 */
+
 	wl_list_init(&server.toplevels);
-	server.xdg_shell = wlr_xdg_shell_create(server.wl_display, 3);
-	server.new_xdg_toplevel.notify = server_new_xdg_toplevel;
-	wl_signal_add(&server.xdg_shell->events.new_toplevel, &server.new_xdg_toplevel);
-	server.new_xdg_popup.notify = server_new_xdg_popup;
-	wl_signal_add(&server.xdg_shell->events.new_popup, &server.new_xdg_popup);
+    wl_list_init(&server.layer_surfaces); // Initialize our list
+
+    server.xdg_shell = wlr_xdg_shell_create(server.wl_display, 3);
+    
+    // Create the manager and save it to the server struct
+    server.layer_shell = wlr_layer_shell_v1_create(server.wl_display, 4); 
+
+    // Listen for new layer surfaces (like waybar)
+    server.new_layer_surface.notify = server_new_layer_surface;
+    wl_signal_add(&server.layer_shell->events.new_surface, &server.new_layer_surface);
+
+    server.new_xdg_toplevel.notify = server_new_xdg_toplevel;
 
 	/*
 	 * Creates a cursor, which is a wlroots utility for tracking the cursor
